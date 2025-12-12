@@ -2,6 +2,10 @@ CC = gcc
 CFLAGS = -Wall -Wextra -Iutils -Isocket_client -Isocket_server -Igui -g `pkg-config --cflags gtk+-3.0`
 LDFLAGS = -lssl -lcrypto -lsqlite3 `pkg-config --libs gtk+-3.0`
 
+ifeq ($(OS),Windows_NT)
+    LDFLAGS += -lws2_32
+endif
+
 # Directory structure
 BIN_DIR = bin
 BUILD_DIR = build

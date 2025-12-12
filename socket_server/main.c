@@ -7,6 +7,11 @@ int main() {
     char instruction[50];
     pthread_t threadId;
 
+    if (set_workdir_to_project_root() != 0) {
+        LOG_ERROR("Failed to set working directory to project root.");
+        return EXIT_FAILURE;
+    }
+
     // Step 1: Initialize and setup server
     if (setupServer(&serverD) == -1) {
         LOG_ERROR("Server setup failed.");

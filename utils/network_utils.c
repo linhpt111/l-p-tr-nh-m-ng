@@ -1,7 +1,42 @@
 #include "utils.h"
 
+#ifdef _WIN32
+static void cleanup_winsock(void) {
+    WSACleanup();
+}
+
+static int ensure_winsock_initialized(void) {
+    static int initialized = 0;
+    static WSADATA wsa_data;
+
+    if (initialized) return 0;
+
+    int result = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+    if (result != 0) {
+        LOG_ERROR("WSAStartup failed: %d", result);
+        return -1;
+    }
+
+    atexit(cleanup_winsock);
+    initialized = 1;
+    return 0;
+}
+#endif
+
 int get_socket() {
-    return socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    if (ensure_winsock_initialized() != 0) {
+        return -1;
+    }
+#endif
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+#ifdef _WIN32
+    if (fd == INVALID_SOCKET) {
+        LOG_ERROR(" [ creating Client Socket Process Failed ]: %ld", WSAGetLastError());
+        return -1;
+    }
+#endif
+    return fd;
 }
 
 struct sockaddr *get_address(int *ui_port, const char* ui_ip) {

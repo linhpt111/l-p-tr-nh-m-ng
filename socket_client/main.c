@@ -7,6 +7,11 @@ int main(int argc, char **argv) {
     clientDetails clientD;
     memset(clientD.active_target, 0, sizeof(clientD.active_target));
 
+    if (set_workdir_to_project_root() != 0) {
+        LOG_ERROR("Failed to set working directory to project root.");
+        return EXIT_FAILURE;
+    }
+
     // integrating basic UI
     GtkWidget* window;
     GtkBuilder* builder;

@@ -2,16 +2,28 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <gtk/gtk.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <io.h>
+#ifndef ssize_t
+typedef SSIZE_T ssize_t;
+#endif
+#define close closesocket
+#else
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <stdlib.h>
-#include <sys/stat.h>
 #include <unistd.h>
-#include <errno.h>
-#include <pthread.h>
-#include <gtk/gtk.h>
-
+#endif
 
 // openssl...
 #include <openssl/rsa.h>
@@ -28,16 +40,17 @@
 #define IP_INPUT_MAX 40 // This extend to manage ipv4 and ipv6(for future implementation)
 #define PORT_INPUT_MAX 7
 #define CLIENT_NAME_INPUT_MAX 62
-#define NETWORK_MESSAGE_BUFFER_SIZE 2000
+#define NETWORK_MESSAGE_BUFFER_SIZE 8192
 #define AES_KEY_SIZE 32 // 256-bit AES key
 #define AES_BLOCK_SIZE 16 // Block size for AES
 #define DB_FILE_PATH "chat_app.db"
-#define UI_CONNECTION_PATH "../gui/connection_dialog.glade"
-#define UI_MAIN_PATH "../gui/main_window.glade"
+#define UI_CONNECTION_PATH "gui/connection_dialog.glade"
+#define UI_MAIN_PATH "gui/main_window.glade"
 #define MESSAGE_TYPE_BROADCAST "ALL"
 #define MESSAGE_TYPE_DM_PREFIX "DM:"
 #define MESSAGE_TYPE_GROUP_PREFIX "GROUP:"
 
+int set_workdir_to_project_root(void);
 
 #define LOG_INFO(format, ...)  g_print("[INFO]: " format "\n", ##__VA_ARGS__)
 #define LOG_ERROR(format, ...) fprintf(stderr, "[ERROR]: " format "\n", ##__VA_ARGS__)
