@@ -44,7 +44,7 @@ int recv_framed_packet(int fd, unsigned char **out, size_t *out_len) {
     uint32_t nlen_net;
     memcpy(&nlen_net, header, sizeof(header));
     uint32_t nlen = ntohl(nlen_net);
-    if (nlen == 0 || nlen > NETWORK_MESSAGE_BUFFER_SIZE * 4) {
+    if (nlen == 0 || nlen > (FILE_TRANSFER_MAX_BYTES * 2)) {
         return -1;
     }
     unsigned char *buf = malloc(nlen);

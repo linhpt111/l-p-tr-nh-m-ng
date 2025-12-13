@@ -137,7 +137,9 @@ char *get_client_name(const char* ui_client_name);
 
 void connection_dialog_button_handler(GtkWidget* button, CDBHData *pack);
 void send_message_handler(GtkWidget *button, SMHPack* pack);
-void add_to_messages_interface(GtkBuilder* builder, const char* message, gboolean is_sent, const char* sender_username);
+void add_to_messages_interface(GtkBuilder* builder, const char* message, gboolean is_sent, const char* sender_username, const char *open_path);
+int send_file_base64(clientDetails *clientD, const char *filepath, const char *target, gboolean is_group);
+void send_file_button_handler(GtkWidget *button, SMHPack* pack);
 
 int file_exists(const char *filename);
 char *bytes_to_base64_encode(const unsigned char *data, size_t len);

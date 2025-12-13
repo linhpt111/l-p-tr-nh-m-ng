@@ -10,6 +10,7 @@
 #define AES_KEY_SIZE 32
 #define AES_BLOCK_SIZE 16
 #define FILE_CHUNK_RAW 2048
+#define FILE_TRANSFER_MAX_BYTES (1024 * 1024) /* ~1 MB */
 
 #define DB_FILE_PATH "chat_app.db"
 #define UI_CONNECTION_PATH "gui/connection_dialog.glade"

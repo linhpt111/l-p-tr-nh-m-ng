@@ -1,11 +1,16 @@
 #include "utils.h"
 #include <time.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
 
 typedef struct {
     GtkBuilder *builder;
     char *message;
     char *sender;
     gboolean is_sent;
+    char *open_path;
 } UiMsgPayload;
 
 typedef struct {
@@ -16,10 +21,11 @@ typedef struct {
 
 static gboolean idle_add_message_cb(gpointer data) {
     UiMsgPayload *p = (UiMsgPayload *)data;
-    add_to_messages_interface(p->builder, p->message, p->is_sent, p->sender);
+    add_to_messages_interface(p->builder, p->message, p->is_sent, p->sender, p->open_path);
     g_object_unref(p->builder);
     free(p->message);
     free(p->sender);
+    if (p->open_path) free(p->open_path);
     free(p);
     return FALSE;
 }
@@ -116,6 +122,7 @@ void *sendMessagesWithGUI(void *pack_ptr) {
     SMData *pack = (SMData *)pack_ptr;
 
     GtkWidget* send_button = GTK_WIDGET(gtk_builder_get_object(pack->builder, "send_button"));
+    GtkWidget* send_file_button = GTK_WIDGET(gtk_builder_get_object(pack->builder, "send_file_button"));
     GtkWidget* group_button = GTK_WIDGET(gtk_builder_get_object(pack->builder, "group_create_button"));
     GtkWidget* group_join_button = GTK_WIDGET(gtk_builder_get_object(pack->builder, "group_join_button"));
     GtkWidget* group_list = GTK_WIDGET(gtk_builder_get_object(pack->builder, "group_list"));
@@ -125,6 +132,9 @@ void *sendMessagesWithGUI(void *pack_ptr) {
     smh_pack->builder = pack->builder;
 
     g_signal_connect(send_button, "clicked", G_CALLBACK(send_message_handler), smh_pack);
+    if (send_file_button) {
+        g_signal_connect(send_file_button, "clicked", G_CALLBACK(send_file_button_handler), smh_pack);
+    }
     if (group_button) {
         g_signal_connect(group_button, "clicked", G_CALLBACK(on_group_create), pack);
     }
@@ -138,6 +148,108 @@ void *sendMessagesWithGUI(void *pack_ptr) {
     return NULL;
 }
 
+static const char *basename_from_path(const char *path) {
+    if (!path) return NULL;
+    const char *slash = strrchr(path, '/');
+    const char *backslash = strrchr(path, '\\');
+    const char *base = path;
+    if (slash && backslash) base = (slash > backslash) ? slash + 1 : backslash + 1;
+    else if (slash) base = slash + 1;
+    else if (backslash) base = backslash + 1;
+    return base;
+}
+
+int send_file_base64(clientDetails *clientD, const char *filepath, const char *target, gboolean is_group) {
+    if (!clientD || !clientD->aes_key || !filepath || !target) return -1;
+
+    FILE *f = fopen(filepath, "rb");
+    if (!f) {
+        LOG_ERROR("Cannot open file: %s", filepath);
+        return -1;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return -1; }
+    if (sz > (long)FILE_TRANSFER_MAX_BYTES) {
+        LOG_ERROR("File too large for transfer limit (~1MB).");
+        fclose(f);
+        return -1;
+    }
+    rewind(f);
+    unsigned char *buf = malloc((size_t)sz);
+    if (!buf) { fclose(f); return -1; }
+    size_t readn = fread(buf, 1, (size_t)sz, f);
+    fclose(f);
+    if (readn != (size_t)sz) { free(buf); return -1; }
+
+    char *b64 = bytes_to_base64_encode(buf, (size_t)sz);
+    free(buf);
+    if (!b64) return -1;
+
+    const char *fname = basename_from_path(filepath);
+    if (!fname || strlen(fname) == 0) fname = "file.bin";
+
+    size_t payload_cap = strlen(fname) + 1 + strlen(b64) + 1;
+    char *payload = malloc(payload_cap);
+    if (!payload) { free(b64); return -1; }
+    snprintf(payload, payload_cap, "%s|%s", fname, b64);
+    free(b64);
+
+    PacketHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = MSG_PUBLISH_FILE;
+    hdr.version = 1;
+    static uint32_t g_file_msg_id = 30000;
+    hdr.messageId = g_file_msg_id++;
+    hdr.timestamp = (uint64_t)time(NULL);
+    strncpy(hdr.sender, clientD->clientName, MAX_USERNAME_LEN - 1);
+    strncpy(hdr.topic, target, MAX_TOPIC_LEN - 1);
+    hdr.flags = is_group ? 0x1 : 0x0;
+
+    int rc = send_protocol_packet(clientD->clientSocketFD, &hdr, (unsigned char *)payload, strlen(payload), clientD->aes_key);
+    free(payload);
+    return rc;
+}
+
+void send_file_button_handler(GtkWidget *button, SMHPack* pack) {
+    UNUSED(button);
+    if (!pack || !pack->data || !pack->builder) return;
+    clientDetails *clientD = pack->data;
+
+    if (strlen(clientD->active_target) == 0) {
+        LOG_ERROR("Select a user or group before sending a file.");
+        return;
+    }
+    if (clientD->active_target_is_group && !clientD->group_joined) {
+        LOG_ERROR("Join the group before sending a file.");
+        return;
+    }
+
+    GtkWidget *dialog = gtk_file_chooser_dialog_new("Select file",
+                                                    NULL,
+                                                    GTK_FILE_CHOOSER_ACTION_OPEN,
+                                                    "_Cancel", GTK_RESPONSE_CANCEL,
+                                                    "_Open", GTK_RESPONSE_ACCEPT,
+                                                    NULL);
+    if (!dialog) return;
+
+    gint resp = gtk_dialog_run(GTK_DIALOG(dialog));
+    if (resp == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        if (filename) {
+            if (send_file_base64(clientD, filename, clientD->active_target, clientD->active_target_is_group) != 0) {
+                LOG_ERROR("Send file failed.");
+            } else {
+                char note[512];
+                snprintf(note, sizeof(note), "You sent file: %s", filename);
+                add_to_messages_interface(pack->builder, note, TRUE, "File", filename);
+            }
+            g_free(filename);
+        }
+    }
+    gtk_widget_destroy(dialog);
+}
+
 void send_message_handler(GtkWidget *button, SMHPack* pack) {
     UNUSED(button);
 
@@ -149,6 +261,30 @@ void send_message_handler(GtkWidget *button, SMHPack* pack) {
         const char *target = NULL;
         if (strlen(pack->data->active_target) > 0) {
             target = pack->data->active_target;
+        }
+
+        // File send command: /sendfile <path>
+        if (g_str_has_prefix(message, "/sendfile ")) {
+            const char *path = message + strlen("/sendfile ");
+            if (!target) {
+                LOG_ERROR("Select a user or group before sending a file.");
+                gtk_entry_set_text(GTK_ENTRY(message_entry), "");
+                return;
+            }
+            if (pack->data->active_target_is_group && !pack->data->group_joined) {
+                LOG_ERROR("Join the group before sending a file.");
+                gtk_entry_set_text(GTK_ENTRY(message_entry), "");
+                return;
+            }
+            if (send_file_base64(pack->data, path, target, pack->data->active_target_is_group) != 0) {
+                LOG_ERROR("Send file failed.");
+            } else {
+                char note[CLIENT_NAME_INPUT_MAX * 2 + 128];
+                snprintf(note, sizeof(note), "You sent file: %s", path);
+                add_to_messages_interface(pack->builder, note, TRUE, "File", path);
+            }
+            gtk_entry_set_text(GTK_ENTRY(message_entry), "");
+            return;
         }
 
         char header[CLIENT_NAME_INPUT_MAX * 2];
@@ -166,7 +302,7 @@ void send_message_handler(GtkWidget *button, SMHPack* pack) {
         } else {
             snprintf(header, sizeof(header), "You");
         }
-        add_to_messages_interface(pack->builder, message, TRUE, header);
+        add_to_messages_interface(pack->builder, message, TRUE, header, NULL);
 
         PacketHeader hdr;
         memset(&hdr, 0, sizeof(hdr));
@@ -196,7 +332,28 @@ void send_message_handler(GtkWidget *button, SMHPack* pack) {
     gtk_entry_set_text(GTK_ENTRY(message_entry), "");
 }
 
-void add_to_messages_interface(GtkBuilder* builder, const char* message, gboolean is_sent, const char* sender_username) {
+static void on_open_file_clicked(GtkButton *button, gpointer user_data) {
+    UNUSED(user_data);
+    const char *path = g_object_get_data(G_OBJECT(button), "open_path");
+    if (!path) return;
+#ifdef _WIN32
+    ShellExecuteA(NULL, "open", path, NULL, NULL, SW_SHOWNORMAL);
+#else
+    gchar *uri = g_filename_to_uri(path, NULL, NULL);
+    if (uri) {
+        GError *err = NULL;
+        if (!g_app_info_launch_default_for_uri(uri, NULL, &err)) {
+            if (err) {
+                g_printerr("Failed to open file: %s\n", err->message);
+                g_error_free(err);
+            }
+        }
+        g_free(uri);
+    }
+#endif
+}
+
+void add_to_messages_interface(GtkBuilder* builder, const char* message, gboolean is_sent, const char* sender_username, const char *open_path) {
     GtkWidget* messages_interface = GTK_WIDGET(gtk_builder_get_object(builder, "messages_interface"));
     if (!messages_interface || !GTK_IS_LIST_BOX(messages_interface)) {
         g_error("Invalid messages_interface!");
@@ -228,6 +385,15 @@ void add_to_messages_interface(GtkBuilder* builder, const char* message, gboolea
 
     gtk_box_pack_start(GTK_BOX(message_node), message_label, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(message_node), username_label, FALSE, FALSE, 0);
+
+    if (open_path && strlen(open_path) > 0) {
+        GtkWidget *open_btn = gtk_button_new_with_label("Open");
+        if (open_btn) {
+            g_object_set_data_full(G_OBJECT(open_btn), "open_path", g_strdup(open_path), g_free);
+            g_signal_connect(open_btn, "clicked", G_CALLBACK(on_open_file_clicked), NULL);
+            gtk_box_pack_start(GTK_BOX(message_node), open_btn, FALSE, FALSE, 2);
+        }
+    }
 
     if (is_sent) {
         gtk_widget_set_halign(message_node, GTK_ALIGN_END);
@@ -337,6 +503,56 @@ void *receiveMessagesWithGUI(void *pack) {
             p->message = g_strdup((const char *)payload);
             p->sender = g_strdup(header);
             p->is_sent = is_sent;
+            p->open_path = NULL;
+            g_idle_add(idle_add_message_cb, p);
+        } else if (hdr.msgType == MSG_PUBLISH_FILE) {
+            const char *sender = hdr.sender;
+            const char *topic = hdr.topic;
+            gboolean is_group = (hdr.flags & 0x1) != 0;
+            gboolean is_sent = sender && clientD->clientName && strcmp(sender, clientD->clientName) == 0;
+
+            char *payload_str = (char *)payload;
+            char *sep = strchr(payload_str, '|');
+            if (!sep) { free(payload); continue; }
+            *sep = '\0';
+            const char *filename = payload_str;
+            const char *b64 = sep + 1;
+
+            size_t decoded_len = 0;
+            unsigned char *decoded = base64_to_bytes_decode(b64, &decoded_len);
+            if (!decoded) { free(payload); continue; }
+
+            char save_path[512];
+            snprintf(save_path, sizeof(save_path), "received_%s", filename);
+            FILE *f = fopen(save_path, "wb");
+            if (f) {
+                fwrite(decoded, 1, decoded_len, f);
+                fclose(f);
+            }
+            free(decoded);
+
+            char header[CLIENT_NAME_INPUT_MAX * 2 + 32];
+            if (topic && strlen(topic) > 0 && strcmp(topic, MESSAGE_TYPE_BROADCAST) != 0) {
+                if (is_group) {
+                    if (is_sent) snprintf(header, sizeof(header), "[#%s] You (file)", topic);
+                    else snprintf(header, sizeof(header), "[#%s] %s (file)", topic, sender ? sender : "Unknown");
+                } else {
+                    if (is_sent) snprintf(header, sizeof(header), "You -> %s (file)", topic);
+                    else snprintf(header, sizeof(header), "%s -> you (file)", sender ? sender : "Unknown");
+                }
+            } else {
+                snprintf(header, sizeof(header), "%s (file)", sender ? sender : "Unknown");
+            }
+
+            char notice[512];
+            snprintf(notice, sizeof(notice), "Received file %s saved to %s", filename, save_path);
+
+            UiMsgPayload *p = malloc(sizeof(UiMsgPayload));
+            p->builder = g_object_ref(builder);
+            p->message = g_strdup(notice);
+            p->sender = g_strdup(header);
+            p->is_sent = is_sent;
+            p->open_path = g_strdup(save_path);
             g_idle_add(idle_add_message_cb, p);
         } else if (hdr.msgType == MSG_ACK) {
             if (strcmp(hdr.topic, "PRESENCE") == 0) {

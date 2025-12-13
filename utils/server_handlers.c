@@ -102,7 +102,7 @@ void *handleNewlyAcceptedClient(void *param) {
         close(clientFd);
         return NULL;
     } else {
-        LOG_SUCCESS("sent == [ public-security-key ] == of size [ %ld ]", strlen(serverD->keys->public_key));
+        LOG_SUCCESS("sent == [ public-security-key ] == of size [ %zu ]", strlen(serverD->keys->public_key));
     }
 
     char encrypted_aes_key_str[NETWORK_MESSAGE_BUFFER_SIZE];
@@ -152,8 +152,6 @@ void *handleNewlyAcceptedClient(void *param) {
     if (x == MAX_CLIENTS) {
         LOG_INFO("Client FD Store is full; consider increasing MAX_CLIENTS");
     }
-    free(decrypted_aes_key);
-
     db_set_user_online(&serverD->db, clientUsername);
     broadcast_presence(serverD);
 
@@ -171,7 +169,7 @@ void *handleNewlyAcceptedClient(void *param) {
         const char *sender = clientUsername;
         int delivered = 0;
 
-        if (hdr_in.msgType == MSG_PUBLISH_TEXT) {
+        if (hdr_in.msgType == MSG_PUBLISH_TEXT || hdr_in.msgType == MSG_PUBLISH_FILE) {
             const char *topic = hdr_in.topic;
             gboolean is_group = (hdr_in.flags & 0x1) != 0;
             db_save_message(&serverD->db, sender, topic, (const char *)payload);
@@ -269,6 +267,7 @@ void *handleNewlyAcceptedClient(void *param) {
         free(payload);
     }
 
+    free(decrypted_aes_key);
     remove_client(serverD, clientFd, clientUsername);
     close(clientFd);
     free(((HNAC *)param)->clientSocketFD);
