@@ -1,38 +1,15 @@
 #include "utils.h"
 
-static const unsigned char STATIC_AES_KEY[32] = {
-        0xC9, 0xED, 0x07, 0xED, 0x15, 0x98, 0x0C, 0x3D,
-        0x27, 0xC9, 0x84, 0xEC, 0x11, 0x67, 0xA2, 0xAC,
-        0xC8, 0x0A, 0x30, 0xC2, 0xD9, 0xB1, 0x1F, 0xC1,
-        0x94, 0x4E, 0xC2, 0xB8, 0xB2, 0xC5, 0x58, 0x2E
-    };
-
 static void broadcast_groups(serverDetails *serverD);
 
-static int send_encrypted_packet(int fd, const char *payload) {
-    if (fd < 0 || !payload) return -1;
-    unsigned char iv[16];
-    if (RAND_bytes(iv, sizeof(iv)) != 1) {
-        fprintf(stderr, "Error generating random IV\n");
-        return -1;
+static unsigned char *get_key_for_fd(serverDetails *serverD, int fd) {
+    if (!serverD) return NULL;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (serverD->clientFDStore[i] == fd) {
+            return serverD->client_aes_keyStore[i];
+        }
     }
-
-    char* ciphertext = encrypt_with_aes(payload, STATIC_AES_KEY, iv);
-    if (!ciphertext) return -1;
-
-    size_t packet_len = sizeof(iv) + strlen(ciphertext);
-    unsigned char* packet = malloc(packet_len);
-    if (!packet) {
-        free(ciphertext);
-        return -1;
-    }
-    memcpy(packet, iv, sizeof(iv));
-    memcpy(packet + sizeof(iv), ciphertext, strlen(ciphertext));
-
-    int rc = send(fd, packet, packet_len, 0);
-    free(packet);
-    free(ciphertext);
-    return rc;
+    return NULL;
 }
 
 static int lookup_fd_by_username(serverDetails *serverD, const char *username) {
@@ -116,7 +93,6 @@ void *handleOtherOperationsOnSeperateThread(void *serverD) {
 }
 
 void *handleNewlyAcceptedClient(void *param) {
-    char receivedMessage[NETWORK_MESSAGE_BUFFER_SIZE];
     const char *basic_message = "secured Connection to Server is established Successfully\n";
     int clientFd = *(((HNAC *)param)->clientSocketFD);
     serverDetails *serverD = ((HNAC *)param)->serverD;
@@ -176,109 +152,74 @@ void *handleNewlyAcceptedClient(void *param) {
     if (x == MAX_CLIENTS) {
         LOG_INFO("Client FD Store is full; consider increasing MAX_CLIENTS");
     }
+    free(decrypted_aes_key);
 
     db_set_user_online(&serverD->db, clientUsername);
     broadcast_presence(serverD);
 
     while (1) {
-        ssize_t bytesReceived = recv(clientFd, receivedMessage, sizeof(receivedMessage) - 1, 0);
-
-        if (bytesReceived < 0) {
+        PacketHeader hdr_in;
+        unsigned char *payload = NULL;
+        size_t payload_len = 0;
+        if (recv_protocol_packet(clientFd, &hdr_in, &payload, &payload_len, decrypted_aes_key) != 0) {
             LOG_ERROR("recv failed");
-            break;
-        } else if (bytesReceived == 0) {
-            LOG_INFO("Client disconnected.");
+            free(payload);
             break;
         }
-        receivedMessage[bytesReceived] = '\0';
 
-        unsigned char iv[16];
-        memcpy(iv, receivedMessage, 16);
+        hdr_in.sender[MAX_USERNAME_LEN - 1] = '\0';
+        const char *sender = clientUsername;
+        int delivered = 0;
 
-        char* ciphertext = (char*)(receivedMessage + 16);
+        if (hdr_in.msgType == MSG_PUBLISH_TEXT) {
+            const char *topic = hdr_in.topic;
+            gboolean is_group = (hdr_in.flags & 0x1) != 0;
+            db_save_message(&serverD->db, sender, topic, (const char *)payload);
 
-        char* plaintext = decrypt_with_aes(ciphertext, decrypted_aes_key, iv);
-        if (!plaintext) {
-            continue;
-        }
+            PacketHeader hdr_out = hdr_in;
+            hdr_out.payloadLength = (uint32_t)payload_len;
+            strncpy(hdr_out.sender, sender, MAX_USERNAME_LEN - 1);
 
-        char *saveptr = NULL;
-        char *type = strtok_r(plaintext, "|", &saveptr);
-        if (type && strcmp(type, "MSG") == 0) {
-            char *channel = strtok_r(NULL, "|", &saveptr);
-            char *sender = strtok_r(NULL, "|", &saveptr);
-            char *body = strtok_r(NULL, "", &saveptr);
-
-            sender = clientUsername; // enforce real sender
-            int delivered = 0;
-            LOG_INFO("[MSG IN] channel=%s sender=%s body=%s", channel ? channel : "(null)", sender, body ? body : "");
-
-            const char *receiver = NULL;
-            char receiver_buf[CLIENT_NAME_INPUT_MAX] = {0};
-            if (channel && strncmp(channel, MESSAGE_TYPE_DM_PREFIX, strlen(MESSAGE_TYPE_DM_PREFIX)) == 0) {
-                strncpy(receiver_buf, channel + strlen(MESSAGE_TYPE_DM_PREFIX), sizeof(receiver_buf) - 1);
-                receiver = receiver_buf;
-            } else if (channel && strncmp(channel, MESSAGE_TYPE_GROUP_PREFIX, strlen(MESSAGE_TYPE_GROUP_PREFIX)) == 0) {
-                strncpy(receiver_buf, channel + strlen(MESSAGE_TYPE_GROUP_PREFIX), sizeof(receiver_buf) - 1);
-                receiver = receiver_buf;
-            } else {
-                receiver = MESSAGE_TYPE_BROADCAST;
-            }
-
-            db_save_message(&serverD->db, sender, receiver, body ? body : "");
-
-            if (receiver && strcmp(receiver, MESSAGE_TYPE_BROADCAST) != 0) {
-                if (channel && strncmp(channel, MESSAGE_TYPE_GROUP_PREFIX, strlen(MESSAGE_TYPE_GROUP_PREFIX)) == 0) {
-                    int groupIndex = -1;
-                    for (int g = 0; g < MAX_GROUPS; g++) {
-                        if (serverD->groupNames[g] && strcmp(serverD->groupNames[g], receiver) == 0) {
-                            groupIndex = g;
-                            break;
-                        }
-                    }
-                    if (groupIndex != -1) {
-                        char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-                        snprintf(payload, sizeof(payload), "MSG|GROUP:%s|%s|%s", receiver, sender, body ? body : "");
-                        for (int i = 0; i < serverD->groupCounts[groupIndex]; i++) {
-                            int target_fd = serverD->groupMembers[groupIndex][i];
-                            if (target_fd != -1) {
-                                send_encrypted_packet(target_fd, payload);
-                                delivered++;
-                            }
-                        }
-                        LOG_INFO("[GROUP %s] %s -> members delivered=%d", receiver, sender, delivered);
-                    } else {
-                        LOG_INFO("[GROUP %s] %s -> no such group", receiver, sender);
-                    }
-                } else {
-                    int target_fd = lookup_fd_by_username(serverD, receiver);
-                    if (target_fd != -1) {
-                        char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-                        snprintf(payload, sizeof(payload), "MSG|DM:%s|%s|%s", receiver, sender, body ? body : "");
-                        send_encrypted_packet(target_fd, payload);
-                        delivered = 1;
-                    } else {
-                        LOG_INFO("User %s not online; skipping DM delivery", receiver);
+            if (is_group && topic && strlen(topic) > 0) {
+                int groupIndex = -1;
+                for (int g = 0; g < MAX_GROUPS; g++) {
+                    if (serverD->groupNames[g] && strcmp(serverD->groupNames[g], topic) == 0) {
+                        groupIndex = g;
+                        break;
                     }
                 }
+                if (groupIndex != -1) {
+                    for (int i = 0; i < serverD->groupCounts[groupIndex]; i++) {
+                        int target_fd = serverD->groupMembers[groupIndex][i];
+                        if (target_fd != -1) {
+                            unsigned char *key = get_key_for_fd(serverD, target_fd);
+                            send_protocol_packet(target_fd, &hdr_out, payload, payload_len, key);
+                            delivered++;
+                        }
+                    }
+                    LOG_INFO("[GROUP %s] %s -> delivered=%d", topic, sender, delivered);
+                }
+            } else if (topic && strcmp(topic, MESSAGE_TYPE_BROADCAST) != 0) {
+                int target_fd = lookup_fd_by_username(serverD, topic);
+                if (target_fd != -1) {
+                    unsigned char *key = get_key_for_fd(serverD, target_fd);
+                    send_protocol_packet(target_fd, &hdr_out, payload, payload_len, key);
+                    delivered = 1;
+                }
             } else {
-                char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-                snprintf(payload, sizeof(payload), "MSG|ALL|%s|%s", sender, body ? body : "");
+                strncpy(hdr_out.topic, MESSAGE_TYPE_BROADCAST, MAX_TOPIC_LEN - 1);
                 for (int i = 0; i < MAX_CLIENTS; i++) {
                     if (clientFDStore[i] != clientFd && clientFDStore[i] != -1) {
-                        send_encrypted_packet(clientFDStore[i], payload);
+                        unsigned char *key = serverD->client_aes_keyStore[i];
+                        send_protocol_packet(clientFDStore[i], &hdr_out, payload, payload_len, key);
                         delivered++;
                     }
                 }
                 LOG_INFO("[BROADCAST] %s delivered=%d", sender, delivered);
             }
-        } else if (type && strcmp(type, "GROUP") == 0) {
-            char *action = strtok_r(NULL, "|", &saveptr);
-            char *groupName = strtok_r(NULL, "|", &saveptr);
-            if (!action || !groupName) {
-                free(plaintext);
-                continue;
-            }
+        } else if (hdr_in.msgType == MSG_SUBSCRIBE) {
+            const char *groupName = hdr_in.topic;
+            if (!groupName || strlen(groupName) == 0) { free(payload); continue; }
             int groupIndex = -1;
             for (int g = 0; g < MAX_GROUPS; g++) {
                 if (serverD->groupNames[g] && strcmp(serverD->groupNames[g], groupName) == 0) {
@@ -286,13 +227,13 @@ void *handleNewlyAcceptedClient(void *param) {
                     break;
                 }
             }
-            if (strcmp(action, "CREATE") == 0 && groupIndex == -1) {
+            if ((hdr_in.flags & 0x1) && groupIndex == -1) {
                 for (int g = 0; g < MAX_GROUPS; g++) {
                     if (!serverD->groupNames[g]) {
                         serverD->groupNames[g] = strdup(groupName);
                         serverD->groupCounts[g] = 0;
                         groupIndex = g;
-                        LOG_INFO("Group created: %s by %s", groupName, clientUsername);
+                        LOG_INFO("Group created: %s by %s", groupName, sender);
                         break;
                     }
                 }
@@ -318,15 +259,14 @@ void *handleNewlyAcceptedClient(void *param) {
                     } else {
                         serverD->groupMembers[groupIndex][serverD->groupCounts[groupIndex]++] = clientFd;
                     }
-                    db_group_join(&serverD->db, clientUsername, groupName);
-                    LOG_INFO("Group join: %s joined %s (size=%d)", clientUsername, groupName, serverD->groupCounts[groupIndex]);
+                    db_group_join(&serverD->db, sender, groupName);
+                    LOG_INFO("Group join: %s joined %s (size=%d)", sender, groupName, serverD->groupCounts[groupIndex]);
                 }
             }
             broadcast_groups(serverD);
         }
 
-        free(plaintext);
-
+        free(payload);
     }
 
     remove_client(serverD, clientFd, clientUsername);
@@ -361,12 +301,17 @@ void broadcast_presence(serverDetails *serverD) {
         user_list[offset - 1] = '\0';
     }
 
-    char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-    snprintf(payload, sizeof(payload), "PRESENCE|%s", user_list);
+    PacketHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = MSG_ACK;
+    hdr.version = 1;
+    strncpy(hdr.topic, "PRESENCE", MAX_TOPIC_LEN - 1);
+    hdr.payloadLength = (uint32_t)strlen(user_list);
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (serverD->clientFDStore[i] != -1) {
-            send_encrypted_packet(serverD->clientFDStore[i], payload);
+            unsigned char *key = serverD->client_aes_keyStore[i];
+            send_protocol_packet(serverD->clientFDStore[i], &hdr, (unsigned char *)user_list, strlen(user_list), key);
         }
     }
     broadcast_groups(serverD);
@@ -388,12 +333,17 @@ static void broadcast_groups(serverDetails *serverD) {
         group_list[offset - 1] = '\0';
     }
 
-    char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-    snprintf(payload, sizeof(payload), "GROUPS|%s", group_list);
+    PacketHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = MSG_ACK;
+    hdr.version = 1;
+    strncpy(hdr.topic, "GROUPS", MAX_TOPIC_LEN - 1);
+    hdr.payloadLength = (uint32_t)strlen(group_list);
 
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (serverD->clientFDStore[i] != -1) {
-            send_encrypted_packet(serverD->clientFDStore[i], payload);
+            unsigned char *key = serverD->client_aes_keyStore[i];
+            send_protocol_packet(serverD->clientFDStore[i], &hdr, (unsigned char *)group_list, strlen(group_list), key);
         }
     }
 }

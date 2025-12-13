@@ -304,3 +304,63 @@ char* decrypt_with_aes(const char* encoded_ciphertext, const unsigned char* aes_
 
     return (char*)plaintext;
 }
+
+int aes_encrypt_bytes(const unsigned char *plaintext, size_t plaintext_len,
+                      const unsigned char *aes_key, const unsigned char *iv,
+                      unsigned char **out_cipher, size_t *out_len) {
+    if (!plaintext || !aes_key || !iv || !out_cipher || !out_len) return -1;
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int rc = EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, aes_key, iv);
+    if (rc != 1) { EVP_CIPHER_CTX_free(ctx); return -1; }
+
+    int max_len = (int)plaintext_len + AES_BLOCK_SIZE;
+    unsigned char *cipher = malloc(max_len);
+    if (!cipher) { EVP_CIPHER_CTX_free(ctx); return -1; }
+
+    int len = 0, total = 0;
+    rc = EVP_EncryptUpdate(ctx, cipher, &len, plaintext, (int)plaintext_len);
+    if (rc != 1) { free(cipher); EVP_CIPHER_CTX_free(ctx); return -1; }
+    total = len;
+
+    rc = EVP_EncryptFinal_ex(ctx, cipher + total, &len);
+    if (rc != 1) { free(cipher); EVP_CIPHER_CTX_free(ctx); return -1; }
+    total += len;
+
+    *out_cipher = cipher;
+    *out_len = (size_t)total;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+}
+
+int aes_decrypt_bytes(const unsigned char *cipher, size_t cipher_len,
+                      const unsigned char *aes_key, const unsigned char *iv,
+                      unsigned char **out_plain, size_t *out_len) {
+    if (!cipher || !aes_key || !iv || !out_plain || !out_len) return -1;
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return -1;
+
+    int rc = EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, aes_key, iv);
+    if (rc != 1) { EVP_CIPHER_CTX_free(ctx); return -1; }
+
+    unsigned char *plain = malloc(cipher_len + 1);
+    if (!plain) { EVP_CIPHER_CTX_free(ctx); return -1; }
+
+    int len = 0, total = 0;
+    rc = EVP_DecryptUpdate(ctx, plain, &len, cipher, (int)cipher_len);
+    if (rc != 1) { free(plain); EVP_CIPHER_CTX_free(ctx); return -1; }
+    total = len;
+
+    rc = EVP_DecryptFinal_ex(ctx, plain + total, &len);
+    if (rc != 1) { free(plain); EVP_CIPHER_CTX_free(ctx); return -1; }
+    total += len;
+    plain[total] = '\0';
+
+    *out_plain = plain;
+    *out_len = (size_t)total;
+    EVP_CIPHER_CTX_free(ctx);
+    return 0;
+}

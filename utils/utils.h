@@ -9,6 +9,8 @@
 #include <stdint.h>
 #include <gtk/gtk.h>
 
+#include "protocol.h"
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -35,31 +37,11 @@ typedef SSIZE_T ssize_t;
 
 #define UNUSED(x) (void)(x)
 
-#define MAX_CLIENTS 200
-#define MAX_GROUPS 50
-#define IP_INPUT_MAX 40 // This extend to manage ipv4 and ipv6(for future implementation)
-#define PORT_INPUT_MAX 7
-#define CLIENT_NAME_INPUT_MAX 62
-#define NETWORK_MESSAGE_BUFFER_SIZE 8192
-#define AES_KEY_SIZE 32 // 256-bit AES key
-#define AES_BLOCK_SIZE 16 // Block size for AES
-#define DB_FILE_PATH "chat_app.db"
-#define UI_CONNECTION_PATH "gui/connection_dialog.glade"
-#define UI_MAIN_PATH "gui/main_window.glade"
-#define MESSAGE_TYPE_BROADCAST "ALL"
-#define MESSAGE_TYPE_DM_PREFIX "DM:"
-#define MESSAGE_TYPE_GROUP_PREFIX "GROUP:"
-
-int set_workdir_to_project_root(void);
-
 #define LOG_INFO(format, ...)  g_print("[INFO]: " format "\n", ##__VA_ARGS__)
 #define LOG_ERROR(format, ...) fprintf(stderr, "[ERROR]: " format "\n", ##__VA_ARGS__)
 #define LOG_SUCCESS(format, ...) g_print("[SUCCESS]: " format "\n", ##__VA_ARGS__)
-#define MESSAGE_FORMAT "%s %s"
 
-
-
-
+int set_workdir_to_project_root(void);
 typedef struct clientDetails{
     int clientSocketFD;
     char *clientName;
@@ -165,6 +147,12 @@ unsigned char *generate_aes_key(size_t key_size);
 char* encrypt_with_aes(const char* plaintext, const unsigned char* aes_key, const unsigned char* iv);
 char* decrypt_with_aes(const char* encoded_ciphertext, const unsigned char* aes_key, const unsigned char* iv);
 char *sanitize_base64(const char *input);
+int aes_encrypt_bytes(const unsigned char *plaintext, size_t plaintext_len,
+                      const unsigned char *aes_key, const unsigned char *iv,
+                      unsigned char **out_cipher, size_t *out_len);
+int aes_decrypt_bytes(const unsigned char *cipher, size_t cipher_len,
+                      const unsigned char *aes_key, const unsigned char *iv,
+                      unsigned char **out_plain, size_t *out_len);
 
 int db_init(DbContext *ctx, const char *path);
 void db_close(DbContext *ctx);
@@ -181,3 +169,8 @@ void refresh_groups(GtkBuilder* builder, clientDetails *clientD, const char* csv
 void on_group_selected(GtkListBox *box, GtkListBoxRow *row, gpointer user_data);
 void on_group_create(GtkButton *button, gpointer user_data);
 void on_group_join(GtkButton *button, gpointer user_data);
+
+int send_framed_packet(int fd, const unsigned char *payload, size_t len);
+int recv_framed_packet(int fd, unsigned char **out, size_t *out_len);
+int send_protocol_packet(int fd, PacketHeader *hdr, const unsigned char *payload, size_t payload_len, const unsigned char *aes_key);
+int recv_protocol_packet(int fd, PacketHeader *hdr_out, unsigned char **payload_out, size_t *payload_len_out, const unsigned char *aes_key);

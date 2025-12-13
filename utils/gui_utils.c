@@ -1,4 +1,5 @@
 #include "utils.h"
+#include <time.h>
 
 typedef struct {
     GtkBuilder *builder;
@@ -166,30 +167,26 @@ void send_message_handler(GtkWidget *button, SMHPack* pack) {
             snprintf(header, sizeof(header), "You");
         }
         add_to_messages_interface(pack->builder, message, TRUE, header);
-        unsigned char iv[16];
 
-        RAND_bytes(iv, sizeof(iv));
+        PacketHeader hdr;
+        memset(&hdr, 0, sizeof(hdr));
+        hdr.msgType = MSG_PUBLISH_TEXT;
+        hdr.version = 1;
+        static uint32_t g_msg_id = 1;
+        hdr.messageId = g_msg_id++;
+        hdr.timestamp = (uint64_t)time(NULL);
+        strncpy(hdr.sender, pack->data->clientName, MAX_USERNAME_LEN - 1);
 
-        char payload[NETWORK_MESSAGE_BUFFER_SIZE];
         if (target) {
-            if (pack->data->active_target_is_group) {
-                snprintf(payload, sizeof(payload), "MSG|GROUP:%s|%s|%s", target, pack->data->clientName, message);
-            } else {
-                snprintf(payload, sizeof(payload), "MSG|DM:%s|%s|%s", target, pack->data->clientName, message);
-            }
+            strncpy(hdr.topic, target, MAX_TOPIC_LEN - 1);
+            hdr.flags = pack->data->active_target_is_group ? 0x1 : 0x0;
         } else {
-            snprintf(payload, sizeof(payload), "MSG|ALL|%s|%s", pack->data->clientName, message);
+            strncpy(hdr.topic, MESSAGE_TYPE_BROADCAST, MAX_TOPIC_LEN - 1);
+            hdr.flags = 0x0;
         }
 
-        char* ciphertext = encrypt_with_aes(payload, pack->data->aes_key, iv);
-
-        size_t packet_len = sizeof(iv) + strlen(ciphertext);
-        unsigned char* packet = malloc(packet_len);
-
-        memcpy(packet, iv, sizeof(iv));
-        memcpy(packet + sizeof(iv), ciphertext, strlen(ciphertext));
-
-        if (send(pack->data->clientSocketFD, packet, packet_len, 0) == -1) {
+        size_t payload_len = strlen(message);
+        if (send_protocol_packet(pack->data->clientSocketFD, &hdr, (const unsigned char *)message, payload_len, pack->data->aes_key) != 0) {
             pack->status = FALSE;
             LOG_ERROR("Send failed");
         } else {
@@ -255,161 +252,109 @@ void add_to_messages_interface(GtkBuilder* builder, const char* message, gboolea
 void *receiveMessagesWithGUI(void *pack) {
     clientDetails *clientD = ((RMWGUI *)pack)->clientD;
     GtkBuilder* builder = ((RMWGUI *)pack)->builder;
-    char buffer[NETWORK_MESSAGE_BUFFER_SIZE];
-    ssize_t bytesReceived;
 
     clientD->public_key = NULL;
     clientD->group_joined = FALSE;
 
-    unsigned char static_aes_key[32] = {
-            0xC9, 0xED, 0x07, 0xED, 0x15, 0x98, 0x0C, 0x3D,
-            0x27, 0xC9, 0x84, 0xEC, 0x11, 0x67, 0xA2, 0xAC,
-            0xC8, 0x0A, 0x30, 0xC2, 0xD9, 0xB1, 0x1F, 0xC1,
-            0x94, 0x4E, 0xC2, 0xB8, 0xB2, 0xC5, 0x58, 0x2E
-        };
+    char buffer[NETWORK_MESSAGE_BUFFER_SIZE];
+    ssize_t bytesReceived;
 
-    while (1) {
+    /* Handshake: receive RSA pubkey, send AES key, receive welcome, send username */
+    while (!clientD->public_key) {
         bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
-        if (bytesReceived < 0) {
-            LOG_ERROR("Receive failed");
-            break;
-        } else if (bytesReceived == 0) {
-            LOG_INFO("Server disconnected.\n");
-            break;
+        if (bytesReceived <= 0) {
+            LOG_ERROR("Receive failed during handshake");
+            return NULL;
+        }
+        buffer[bytesReceived] = '\0';
+        g_print("Public key trying to sync\n");
+        process_public_key(buffer, &clientD->public_key);
+        if (!clientD->public_key) continue;
+
+        g_print("Public Key synced...\n");
+        unsigned char *aes_key = generate_aes_key(AES_KEY_SIZE);
+        clientD->aes_key = aes_key;
+        unsigned char encrypted_aes_key[RSA_size(clientD->public_key)];
+        int encrypted_key_len = RSA_public_encrypt(
+            AES_KEY_SIZE,
+            aes_key,
+            encrypted_aes_key,
+            clientD->public_key,
+            RSA_PKCS1_OAEP_PADDING
+        );
+
+        if (encrypted_key_len == -1) {
+            fprintf(stderr, "Error encrypting AES key: %s\n", ERR_error_string(ERR_get_error(), NULL));
+            exit(EXIT_FAILURE);
         }
 
+        char *b64_encoded_key = bytes_to_base64_encode(encrypted_aes_key, encrypted_key_len);
+        send(clientD->clientSocketFD, b64_encoded_key, strlen(b64_encoded_key), 0);
+        free(b64_encoded_key);
+
+        bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
+        if (bytesReceived <= 0) {
+            LOG_ERROR("Receive failed during handshake");
+            return NULL;
+        }
         buffer[bytesReceived] = '\0';
 
-        if (clientD->public_key) {
-            if (bytesReceived < 16) {
-                LOG_ERROR("Received data is too small for IV extraction.");
-                break;
-            }
+        size_t name_len = strlen(clientD->clientName) + 1;
+        send(clientD->clientSocketFD, clientD->clientName, name_len, 0);
+        LOG_SUCCESS("Successfully sent client details to the server.");
+    }
 
-            unsigned char iv[16];
-            memcpy(iv, buffer, 16);
-
-            char message[NETWORK_MESSAGE_BUFFER_SIZE];
-            size_t message_length = bytesReceived - 16;
-            memcpy(message, buffer + 16, message_length);
-            message[message_length] = '\0';
-
-            char *decrypted_message = decrypt_with_aes(message, static_aes_key, iv);
-            if (!decrypted_message) {
-                continue;
-            }
-
-            char *saveptr = NULL;
-            char *type = strtok_r(decrypted_message, "|", &saveptr);
-            if (type && strcmp(type, "PRESENCE") == 0) {
-                char *csv = strtok_r(NULL, "|", &saveptr);
-                UiPresencePayload *p = malloc(sizeof(UiPresencePayload));
-                p->builder = g_object_ref(builder);
-                p->clientD = clientD;
-                p->csv = csv ? g_strdup(csv) : g_strdup("");
-                g_idle_add(idle_refresh_presence_cb, p);
-                free(decrypted_message);
-                continue;
-            } else if (type && strcmp(type, "GROUPS") == 0) {
-                char *csv = strtok_r(NULL, "|", &saveptr);
-                UiPresencePayload *p = malloc(sizeof(UiPresencePayload));
-                p->builder = g_object_ref(builder);
-                p->clientD = clientD;
-                p->csv = csv ? g_strdup(csv) : g_strdup("");
-                g_idle_add(idle_refresh_groups_cb, p);
-                free(decrypted_message);
-                continue;
-            }
-
-            if (type && strcmp(type, "MSG") == 0) {
-                char *channel = strtok_r(NULL, "|", &saveptr);
-                char *sender = strtok_r(NULL, "|", &saveptr);
-                char *body = strtok_r(NULL, "", &saveptr);
-
-                gboolean is_sent = sender && clientD->clientName && strcmp(sender, clientD->clientName) == 0;
-                char header[CLIENT_NAME_INPUT_MAX * 2];
-
-                if (channel && strncmp(channel, MESSAGE_TYPE_DM_PREFIX, strlen(MESSAGE_TYPE_DM_PREFIX)) == 0) {
-                    const char *target = channel + strlen(MESSAGE_TYPE_DM_PREFIX);
-                    if (is_sent) {
-                        snprintf(header, sizeof(header), "You -> %s", target);
-                    } else {
-                        snprintf(header, sizeof(header), "%s -> you", sender ? sender : "Unknown");
-                    }
-                } else if (channel && strncmp(channel, MESSAGE_TYPE_GROUP_PREFIX, strlen(MESSAGE_TYPE_GROUP_PREFIX)) == 0) {
-                    const char *group = channel + strlen(MESSAGE_TYPE_GROUP_PREFIX);
-                    if (is_sent) {
-                        snprintf(header, sizeof(header), "[#%s] You", group);
-                    } else {
-                        snprintf(header, sizeof(header), "[#%s] %s", group, sender ? sender : "Unknown");
-                    }
-                } else {
-                    snprintf(header, sizeof(header), "%s", sender ? sender : "Unknown");
-                }
-
-                UiMsgPayload *p = malloc(sizeof(UiMsgPayload));
-                p->builder = g_object_ref(builder);
-                p->message = g_strdup(body ? body : "");
-                p->sender = g_strdup(header);
-                p->is_sent = is_sent;
-                g_idle_add(idle_add_message_cb, p);
-            }
-
-            free(decrypted_message);
-        } else {
-            g_print("Public key trying to sync\n");
-            process_public_key(buffer, &clientD->public_key);
-            if (clientD->public_key) {
-                g_print("Public Key synced...\n");
-
-                unsigned char *aes_key = generate_aes_key(AES_KEY_SIZE);
-
-                clientD->aes_key = aes_key;
-                unsigned char encrypted_aes_key[RSA_size(clientD->public_key)];
-                int encrypted_key_len = RSA_public_encrypt(
-                    AES_KEY_SIZE,
-                    aes_key,
-                    encrypted_aes_key,
-                    clientD->public_key,
-                    RSA_PKCS1_OAEP_PADDING
-                );
-
-                if (encrypted_key_len == -1) {
-                    fprintf(stderr, "Error encrypting AES key: %s\n", ERR_error_string(ERR_get_error(), NULL));
-                    exit(EXIT_FAILURE);
-                }
-
-                char *b64_encoded_key = bytes_to_base64_encode(encrypted_aes_key, encrypted_key_len);
-
-                if (send(clientD->clientSocketFD, b64_encoded_key, strlen(b64_encoded_key), 0) == -1) {
-                    LOG_ERROR("Sending AES_key failed");
-                    free(b64_encoded_key);
-                    exit(EXIT_FAILURE);
-                }
-                free(b64_encoded_key);
-
-                bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
-                if (bytesReceived < 0) {
-                    LOG_ERROR("Receive failed");
-                    break;
-                } else if (bytesReceived == 0) {
-                    LOG_INFO("Server disconnected.\n");
-                    break;
-                }
-
-                buffer[bytesReceived] = '\0';
-            }
-
-            size_t name_len = strlen(clientD->clientName) + 1;
-            if (send(clientD->clientSocketFD, clientD->clientName, name_len, 0) < 0) {
-                LOG_ERROR("Failed to send user details to server: %s", strerror(errno));
-                close(clientD->clientSocketFD);
-                free(clientD->clientName);
-                free(clientD->serverAddress);
-                return NULL;
-            }
-            LOG_SUCCESS("Successfully sent client details to the server.");
+    while (1) {
+        PacketHeader hdr;
+        unsigned char *payload = NULL;
+        size_t payload_len = 0;
+        if (recv_protocol_packet(clientD->clientSocketFD, &hdr, &payload, &payload_len, clientD->aes_key) != 0) {
+            LOG_ERROR("Receive failed");
+            break;
         }
+
+        if (hdr.msgType == MSG_PUBLISH_TEXT) {
+            const char *sender = hdr.sender;
+            const char *topic = hdr.topic;
+            gboolean is_group = (hdr.flags & 0x1) != 0;
+            gboolean is_sent = sender && clientD->clientName && strcmp(sender, clientD->clientName) == 0;
+
+            char header[CLIENT_NAME_INPUT_MAX * 2];
+            if (topic && strlen(topic) > 0 && strcmp(topic, MESSAGE_TYPE_BROADCAST) != 0) {
+                if (is_group) {
+                    if (is_sent) snprintf(header, sizeof(header), "[#%s] You", topic);
+                    else snprintf(header, sizeof(header), "[#%s] %s", topic, sender ? sender : "Unknown");
+                } else {
+                    if (is_sent) snprintf(header, sizeof(header), "You -> %s", topic);
+                    else snprintf(header, sizeof(header), "%s -> you", sender ? sender : "Unknown");
+                }
+            } else {
+                snprintf(header, sizeof(header), "%s", sender ? sender : "Unknown");
+            }
+
+            UiMsgPayload *p = malloc(sizeof(UiMsgPayload));
+            p->builder = g_object_ref(builder);
+            p->message = g_strdup((const char *)payload);
+            p->sender = g_strdup(header);
+            p->is_sent = is_sent;
+            g_idle_add(idle_add_message_cb, p);
+        } else if (hdr.msgType == MSG_ACK) {
+            if (strcmp(hdr.topic, "PRESENCE") == 0) {
+                UiPresencePayload *p = malloc(sizeof(UiPresencePayload));
+                p->builder = g_object_ref(builder);
+                p->clientD = clientD;
+                p->csv = g_strdup((const char *)payload);
+                g_idle_add(idle_refresh_presence_cb, p);
+            } else if (strcmp(hdr.topic, "GROUPS") == 0) {
+                UiPresencePayload *p = malloc(sizeof(UiPresencePayload));
+                p->builder = g_object_ref(builder);
+                p->clientD = clientD;
+                p->csv = g_strdup((const char *)payload);
+                g_idle_add(idle_refresh_groups_cb, p);
+            }
+        }
+
+        free(payload);
     }
 
     return NULL;
@@ -572,20 +517,19 @@ void on_group_create(GtkButton *button, gpointer user_data) {
     const char *name = gtk_entry_get_text(GTK_ENTRY(entry));
     if (!name || strlen(name) == 0) return;
 
-    unsigned char iv[16];
-    RAND_bytes(iv, sizeof(iv));
-    char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-    snprintf(payload, sizeof(payload), "GROUP|CREATE|%s", name);
-    char *ciphertext = encrypt_with_aes(payload, clientD->aes_key, iv);
-    if (ciphertext) {
-        size_t packet_len = sizeof(iv) + strlen(ciphertext);
-        unsigned char* packet = malloc(packet_len);
-        memcpy(packet, iv, sizeof(iv));
-        memcpy(packet + sizeof(iv), ciphertext, strlen(ciphertext));
-        send(clientD->clientSocketFD, packet, packet_len, 0);
-        free(packet);
-        free(ciphertext);
-    }
+    PacketHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = MSG_SUBSCRIBE;
+    hdr.version = 1;
+    hdr.flags = 0x1; /* create flag */
+    static uint32_t g_msg_id = 10000;
+    hdr.messageId = g_msg_id++;
+    hdr.timestamp = (uint64_t)time(NULL);
+    strncpy(hdr.sender, clientD->clientName, MAX_USERNAME_LEN - 1);
+    strncpy(hdr.topic, name, MAX_TOPIC_LEN - 1);
+
+    const unsigned char empty_payload = 0;
+    send_protocol_packet(clientD->clientSocketFD, &hdr, &empty_payload, 0, clientD->aes_key);
     gtk_entry_set_text(GTK_ENTRY(entry), "");
 }
 
@@ -601,20 +545,19 @@ void on_group_join(GtkButton *button, gpointer user_data) {
         return;
     }
 
-    unsigned char iv[16];
-    RAND_bytes(iv, sizeof(iv));
-    char payload[NETWORK_MESSAGE_BUFFER_SIZE];
-    snprintf(payload, sizeof(payload), "GROUP|JOIN|%s", clientD->active_target);
-    char *ciphertext = encrypt_with_aes(payload, clientD->aes_key, iv);
-    if (ciphertext) {
-        size_t packet_len = sizeof(iv) + strlen(ciphertext);
-        unsigned char* packet = malloc(packet_len);
-        memcpy(packet, iv, sizeof(iv));
-        memcpy(packet + sizeof(iv), ciphertext, strlen(ciphertext));
-        send(clientD->clientSocketFD, packet, packet_len, 0);
-        free(packet);
-        free(ciphertext);
-    }
+    PacketHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.msgType = MSG_SUBSCRIBE;
+    hdr.version = 1;
+    hdr.flags = 0x0; /* join existing */
+    static uint32_t g_sub_msg_id = 20000;
+    hdr.messageId = g_sub_msg_id++;
+    hdr.timestamp = (uint64_t)time(NULL);
+    strncpy(hdr.sender, clientD->clientName, MAX_USERNAME_LEN - 1);
+    strncpy(hdr.topic, clientD->active_target, MAX_TOPIC_LEN - 1);
+
+    const unsigned char empty_payload = 0;
+    send_protocol_packet(clientD->clientSocketFD, &hdr, &empty_payload, 0, clientD->aes_key);
 
     clientD->group_joined = TRUE;
     GtkWidget *header_label = GTK_WIDGET(gtk_builder_get_object(builder, "chat_header_label"));
