@@ -58,6 +58,65 @@ int recv_framed_packet(int fd, unsigned char **out, size_t *out_len) {
     return 0;
 }
 
+int perform_client_handshake(clientDetails *clientD) {
+    if (!clientD || clientD->clientSocketFD <= 0 || !clientD->clientName) {
+        LOG_ERROR("Invalid client details for handshake");
+        return -1;
+    }
+
+    char buffer[NETWORK_MESSAGE_BUFFER_SIZE];
+    ssize_t bytesReceived;
+    clientD->public_key = NULL;
+
+    while (!clientD->public_key) {
+        bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
+        if (bytesReceived <= 0) {
+            LOG_ERROR("Receive failed during handshake");
+            return -1;
+        }
+        buffer[bytesReceived] = '\0';
+        process_public_key(buffer, &clientD->public_key);
+        if (!clientD->public_key) continue;
+
+        unsigned char *aes_key = generate_aes_key(AES_KEY_SIZE);
+        clientD->aes_key = aes_key;
+        unsigned char encrypted_aes_key[RSA_size(clientD->public_key)];
+        int encrypted_key_len = RSA_public_encrypt(
+            AES_KEY_SIZE,
+            aes_key,
+            encrypted_aes_key,
+            clientD->public_key,
+            RSA_PKCS1_OAEP_PADDING
+        );
+
+        if (encrypted_key_len == -1) {
+            LOG_ERROR("Error encrypting AES key: %s", ERR_error_string(ERR_get_error(), NULL));
+            return -1;
+        }
+
+        char *b64_encoded_key = bytes_to_base64_encode(encrypted_aes_key, encrypted_key_len);
+        if (!b64_encoded_key) {
+            LOG_ERROR("Failed to encode AES key");
+            return -1;
+        }
+        send(clientD->clientSocketFD, b64_encoded_key, strlen(b64_encoded_key), 0);
+        free(b64_encoded_key);
+
+        bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
+        if (bytesReceived <= 0) {
+            LOG_ERROR("Receive failed during handshake");
+            return -1;
+        }
+        buffer[bytesReceived] = '\0';
+
+        size_t name_len = strlen(clientD->clientName) + 1;
+        send(clientD->clientSocketFD, clientD->clientName, name_len, 0);
+        LOG_SUCCESS("Successfully sent client details to the server.");
+    }
+
+    return 0;
+}
+
 int send_protocol_packet(int fd, PacketHeader *hdr, const unsigned char *payload, size_t payload_len, const unsigned char *aes_key) {
     if (!hdr || !aes_key || !payload) return -1;
 

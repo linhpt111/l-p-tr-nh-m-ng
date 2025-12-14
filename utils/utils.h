@@ -174,5 +174,6 @@ void on_group_join(GtkButton *button, gpointer user_data);
 
 int send_framed_packet(int fd, const unsigned char *payload, size_t len);
 int recv_framed_packet(int fd, unsigned char **out, size_t *out_len);
+int perform_client_handshake(clientDetails *clientD);
 int send_protocol_packet(int fd, PacketHeader *hdr, const unsigned char *payload, size_t payload_len, const unsigned char *aes_key);
 int recv_protocol_packet(int fd, PacketHeader *hdr_out, unsigned char **payload_out, size_t *payload_len_out, const unsigned char *aes_key);

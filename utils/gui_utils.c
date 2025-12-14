@@ -419,55 +419,11 @@ void *receiveMessagesWithGUI(void *pack) {
     clientDetails *clientD = ((RMWGUI *)pack)->clientD;
     GtkBuilder* builder = ((RMWGUI *)pack)->builder;
 
-    clientD->public_key = NULL;
     clientD->group_joined = FALSE;
 
-    char buffer[NETWORK_MESSAGE_BUFFER_SIZE];
-    ssize_t bytesReceived;
-
-    /* Handshake: receive RSA pubkey, send AES key, receive welcome, send username */
-    while (!clientD->public_key) {
-        bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
-        if (bytesReceived <= 0) {
-            LOG_ERROR("Receive failed during handshake");
-            return NULL;
-        }
-        buffer[bytesReceived] = '\0';
-        g_print("Public key trying to sync\n");
-        process_public_key(buffer, &clientD->public_key);
-        if (!clientD->public_key) continue;
-
-        g_print("Public Key synced...\n");
-        unsigned char *aes_key = generate_aes_key(AES_KEY_SIZE);
-        clientD->aes_key = aes_key;
-        unsigned char encrypted_aes_key[RSA_size(clientD->public_key)];
-        int encrypted_key_len = RSA_public_encrypt(
-            AES_KEY_SIZE,
-            aes_key,
-            encrypted_aes_key,
-            clientD->public_key,
-            RSA_PKCS1_OAEP_PADDING
-        );
-
-        if (encrypted_key_len == -1) {
-            fprintf(stderr, "Error encrypting AES key: %s\n", ERR_error_string(ERR_get_error(), NULL));
-            exit(EXIT_FAILURE);
-        }
-
-        char *b64_encoded_key = bytes_to_base64_encode(encrypted_aes_key, encrypted_key_len);
-        send(clientD->clientSocketFD, b64_encoded_key, strlen(b64_encoded_key), 0);
-        free(b64_encoded_key);
-
-        bytesReceived = recv(clientD->clientSocketFD, buffer, sizeof(buffer) - 1, 0);
-        if (bytesReceived <= 0) {
-            LOG_ERROR("Receive failed during handshake");
-            return NULL;
-        }
-        buffer[bytesReceived] = '\0';
-
-        size_t name_len = strlen(clientD->clientName) + 1;
-        send(clientD->clientSocketFD, clientD->clientName, name_len, 0);
-        LOG_SUCCESS("Successfully sent client details to the server.");
+    if (perform_client_handshake(clientD) != 0) {
+        LOG_ERROR("Handshake failed");
+        return NULL;
     }
 
     while (1) {
